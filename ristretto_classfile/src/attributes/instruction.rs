@@ -17,7 +17,7 @@ use std::io::Cursor;
 /// Returns an error if the method descriptor cannot be parsed.
 fn invoke_stack_effect(descriptor: &JavaStr, has_receiver: bool) -> Result<(u16, u16)> {
     let (parameters, return_type) = FieldType::parse_method_descriptor(descriptor)?;
-    let mut pops = if has_receiver { 1_u32 } else { 0 };
+    let mut pops = u32::from(has_receiver);
     for parameter in &parameters {
         pops += u32::from(parameter.slot_count());
     }
