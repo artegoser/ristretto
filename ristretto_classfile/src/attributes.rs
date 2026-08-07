@@ -149,7 +149,7 @@ pub use local_variable_table::LocalVariableTable;
 pub use local_variable_target::LocalVariableTarget;
 pub use local_variable_type_table::LocalVariableTypeTable;
 pub use max_locals::MaxLocals;
-pub use max_stack::MaxStack;
+pub use max_stack::{MaxStack, max_stack_with_exception_table};
 pub use method_parameter::MethodParameter;
 pub use module_access_flags::ModuleAccessFlags;
 pub use nested_class_access_flags::NestedClassAccessFlags;
