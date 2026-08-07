@@ -2,7 +2,7 @@ use crate::Error::InvalidInstructionOffset;
 use crate::attributes::bootstrap_method::BootstrapMethod;
 use crate::attributes::inner_class::InnerClass;
 use crate::attributes::line_number::LineNumber;
-use crate::attributes::offset_utils::{self, lookup_byte_offset, lookup_byte_offset_le};
+use crate::attributes::offset_utils::{self, lookup_byte_offset};
 use crate::attributes::parameter_annotation::ParameterAnnotation;
 use crate::attributes::{
     Annotation, AnnotationElement, ExceptionTableEntry, Exports, Instruction, LocalVariableTable,
@@ -725,9 +725,12 @@ impl Attribute {
                             .ok_or(InvalidInstructionOffset(u32::from(
                                 exception.range_pc.start,
                             )))?;
-                    exception.range_pc.end =
-                        lookup_byte_offset_le(&byte_to_instruction_pairs, exception.range_pc.end)
-                            .ok_or(InvalidInstructionOffset(u32::from(exception.range_pc.end)))?;
+                    exception.range_pc.end = if u32::from(exception.range_pc.end) == code_length {
+                        u16::try_from(instructions.len())?
+                    } else {
+                        lookup_byte_offset(&byte_to_instruction_pairs, exception.range_pc.end)
+                            .ok_or(InvalidInstructionOffset(u32::from(exception.range_pc.end)))?
+                    };
                     exception.handler_pc =
                         lookup_byte_offset(&byte_to_instruction_pairs, exception.handler_pc)
                             .ok_or(InvalidInstructionOffset(u32::from(exception.handler_pc)))?;
@@ -1229,12 +1232,13 @@ impl Attribute {
                         .ok_or(InvalidInstructionOffset(u32::from(
                             exception.range_pc.start,
                         )))?;
-                    exception.range_pc.end = instruction_to_byte_map
-                        .iter()
-                        .filter(|&(&k, _)| k <= exception.range_pc.end)
-                        .max_by_key(|&(&k, _)| k)
-                        .map(|(_, &v)| v)
-                        .ok_or(InvalidInstructionOffset(u32::from(exception.range_pc.end)))?;
+                    exception.range_pc.end = if usize::from(exception.range_pc.end) == code.len() {
+                        u16::try_from(code_bytes.len())?
+                    } else {
+                        *instruction_to_byte_map
+                            .get(&exception.range_pc.end)
+                            .ok_or(InvalidInstructionOffset(u32::from(exception.range_pc.end)))?
+                    };
                     exception.handler_pc = *instruction_to_byte_map
                         .get(&exception.handler_pc)
                         .ok_or(InvalidInstructionOffset(u32::from(exception.handler_pc)))?;
@@ -1801,12 +1805,13 @@ impl fmt::Display for Attribute {
                     exception.range_pc.start = *instruction_to_byte_map
                         .get(&exception.range_pc.start)
                         .ok_or(fmt::Error)?;
-                    exception.range_pc.end = instruction_to_byte_map
-                        .iter()
-                        .filter(|&(&k, _)| k <= exception.range_pc.end)
-                        .max_by_key(|&(&k, _)| k)
-                        .map(|(_, &v)| v + 1)
-                        .ok_or(fmt::Error)?;
+                    exception.range_pc.end = if usize::from(exception.range_pc.end) == code.len() {
+                        u16::try_from(code_bytes.len()).map_err(|_| fmt::Error)?
+                    } else {
+                        *instruction_to_byte_map
+                            .get(&exception.range_pc.end)
+                            .ok_or(fmt::Error)?
+                    };
                     exception.handler_pc = *instruction_to_byte_map
                         .get(&exception.handler_pc)
                         .ok_or(fmt::Error)?;
@@ -2017,7 +2022,7 @@ mod test {
                  6: nop
                  7: nop
                  8: return
-              [ExceptionTableEntry { range_pc: 0..2, handler_pc: 0, catch_type: 4 }]
+              [ExceptionTableEntry { range_pc: 0..1, handler_pc: 0, catch_type: 4 }]
               ConstantValue { name_index: 2, constant_value_index: 42 }
               LineNumberTable:
                 line 1: 0
@@ -2067,6 +2072,59 @@ mod test {
         }
         let code_attribute = Attribute::from_bytes(&constant_pool, &mut reader)?;
         assert_eq!(attribute, code_attribute);
+        Ok(())
+    }
+
+    #[test]
+    fn test_code_exception_range_can_end_at_code_length() -> Result<()> {
+        let mut constant_pool = ConstantPool::new();
+        let code_name_index = constant_pool.add_utf8("Code")?;
+        let attribute = Attribute::Code {
+            name_index: code_name_index,
+            max_stack: 1,
+            max_locals: 1,
+            code: vec![Instruction::Sipush(42), Instruction::Return],
+            exception_table: vec![ExceptionTableEntry {
+                range_pc: 0..2,
+                handler_pc: 1,
+                catch_type: 0,
+            }],
+            attributes: Vec::new(),
+        };
+
+        let mut bytes = Vec::new();
+        attribute.to_bytes(&mut bytes)?;
+        let mut reader = ByteReader::new(&bytes);
+        let parsed = Attribute::from_bytes(&constant_pool, &mut reader)?;
+        assert_eq!(parsed, attribute);
+        assert!(attribute.to_string().contains("range_pc: 0..4"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_code_exception_range_uses_instruction_boundary_byte_offset() -> Result<()> {
+        let mut constant_pool = ConstantPool::new();
+        let code_name_index = constant_pool.add_utf8("Code")?;
+        let attribute = Attribute::Code {
+            name_index: code_name_index,
+            max_stack: 1,
+            max_locals: 1,
+            code: vec![Instruction::Sipush(42), Instruction::Return],
+            exception_table: vec![ExceptionTableEntry {
+                range_pc: 0..1,
+                handler_pc: 1,
+                catch_type: 0,
+            }],
+            attributes: Vec::new(),
+        };
+
+        assert!(attribute.to_string().contains("range_pc: 0..3"));
+
+        let mut bytes = Vec::new();
+        attribute.to_bytes(&mut bytes)?;
+        let mut reader = ByteReader::new(&bytes);
+        let parsed = Attribute::from_bytes(&constant_pool, &mut reader)?;
+        assert_eq!(parsed, attribute);
         Ok(())
     }
 

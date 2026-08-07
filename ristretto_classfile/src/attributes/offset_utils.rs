@@ -57,19 +57,6 @@ pub(crate) fn lookup_byte_offset(pairs: &[(u16, u16)], byte_offset: u16) -> Opti
         })
 }
 
-/// Look up the largest byte offset <= `byte_offset` in the sorted pairs.
-#[inline]
-pub(crate) fn lookup_byte_offset_le(pairs: &[(u16, u16)], byte_offset: u16) -> Option<u16> {
-    let idx = pairs.partition_point(|&(k, _)| k <= byte_offset);
-    if idx > 0 {
-        pairs
-            .get(idx - 1)
-            .map(|(_, instruction_index)| *instruction_index)
-    } else {
-        None
-    }
-}
-
 /// Internal implementation using `ByteReader` for zero-overhead instruction parsing.
 /// Returns (`byte_to_instruction_pairs`, instructions) where `byte_to_instruction_pairs` is a
 /// sorted Vec of (`byte_offset`, `instruction_index`) pairs for binary search lookup.
@@ -886,9 +873,4 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_lookup_byte_offset_le_before_first_offset() {
-        let pairs = [(3, 0), (5, 1)];
-        assert_eq!(None, lookup_byte_offset_le(&pairs, 2));
-    }
 }

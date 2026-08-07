@@ -13,8 +13,9 @@ use std::ops::Range;
 ///
 /// **Note on PC representation:** In this implementation, `start_pc`, `end_pc`, and `handler_pc`
 /// represent indices into the logical sequence of `Instruction`s within the `Code` attribute,
-/// rather than raw byte offsets as in the class file format. This abstraction simplifies
-/// instruction manipulation and analysis.
+/// rather than raw byte offsets as in the class file format. The exclusive `end_pc` may equal the
+/// instruction count, representing a protected range that extends through the final instruction.
+/// This abstraction simplifies instruction manipulation and analysis.
 ///
 /// See the [JVMS §4.7.3](https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.7.3)
 /// for more details (specifically, the `exception_table` within the `Code` attribute).
