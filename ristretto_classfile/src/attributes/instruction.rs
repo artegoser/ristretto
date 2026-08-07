@@ -10,29 +10,29 @@ use indexmap::IndexMap;
 use std::fmt;
 use std::io::Cursor;
 
-/// Compute the operand-stack delta for an `invoke*` instruction given the
-/// method descriptor referenced by its constant-pool entry.
-///
-/// Per JVMS 2.6.2 / 6.5.invoke*:
-/// * each parameter pops [`FieldType::slot_count`] slots,
-/// * if `has_receiver` is `true` an additional reference slot (the `this`
-///   pointer) is popped,
-/// * if the method has a return type its [`FieldType::slot_count`] slots are
-///   pushed back onto the operand stack.
+/// Returns the operand-stack slots consumed and produced by an `invoke*` instruction.
 ///
 /// # Errors
 ///
-/// Returns an error if the descriptor cannot be parsed.
-fn invoke_stack_delta(descriptor: &JavaStr, has_receiver: bool) -> Result<i16> {
+/// Returns an error if the method descriptor cannot be parsed.
+fn invoke_stack_effect(descriptor: &JavaStr, has_receiver: bool) -> Result<(u16, u16)> {
     let (parameters, return_type) = FieldType::parse_method_descriptor(descriptor)?;
-    let mut delta: i16 = if has_receiver { -1 } else { 0 };
+    let mut pops = if has_receiver { 1_u32 } else { 0 };
     for parameter in &parameters {
-        delta -= i16::from(parameter.slot_count());
+        pops += u32::from(parameter.slot_count());
     }
-    if let Some(return_type) = return_type {
-        delta += i16::from(return_type.slot_count());
-    }
-    Ok(delta)
+    let pops = u16::try_from(pops)?;
+    let pushes = return_type.map_or(0, |return_type| u16::from(return_type.slot_count()));
+    Ok((pops, pushes))
+}
+
+fn field_stack_slots(field_index: u16, constant_pool: &ConstantPool<'_>) -> Result<u16> {
+    let (_class_index, name_and_type_index) = constant_pool.try_get_field_ref(field_index)?;
+    let (_name_index, descriptor_index) =
+        constant_pool.try_get_name_and_type(*name_and_type_index)?;
+    let descriptor = constant_pool.try_get_utf8(*descriptor_index)?;
+    let field_type = FieldType::parse_java_str(descriptor)?;
+    Ok(u16::from(field_type.slot_count()))
 }
 
 /// Separate structure for the `tableswitch` instruction to limit the size of the `Instruction`
@@ -1429,16 +1429,30 @@ impl Instruction {
         }
     }
 
-    /// Return the stack utilization delta by the instruction. This is useful for calculating the
-    /// maximum stack size required for a method.
+    /// Returns the operand-stack slots consumed and produced by the instruction.
+    ///
+    /// The returned tuple is `(popped_slots, pushed_slots)`. Category-2 values (`long` and
+    /// `double`) occupy two slots.
     ///
     /// # Errors
     ///
-    /// - if a method is not a valid method reference
-    /// - if a data type cannot be converted
+    /// Returns an error if a referenced field or method descriptor is invalid.
     #[expect(clippy::too_many_lines)]
-    pub fn stack_delta(&self, constant_pool: &ConstantPool<'_>) -> Result<i16> {
-        let delta = match self {
+    pub(crate) fn stack_effect(&self, constant_pool: &ConstantPool<'_>) -> Result<(u16, u16)> {
+        let effect = match self {
+            Instruction::Nop
+            | Instruction::Iinc(..)
+            | Instruction::Goto(..)
+            | Instruction::Ret(..)
+            | Instruction::Return
+            | Instruction::Wide
+            | Instruction::Goto_w(..)
+            | Instruction::Breakpoint
+            | Instruction::Impdep1
+            | Instruction::Impdep2
+            | Instruction::Iinc_w(..)
+            | Instruction::Ret_w(..) => (0, 0),
+
             Instruction::Aconst_null
             | Instruction::Iconst_m1
             | Instruction::Iconst_0
@@ -1447,137 +1461,101 @@ impl Instruction {
             | Instruction::Iconst_3
             | Instruction::Iconst_4
             | Instruction::Iconst_5
-            | Instruction::Lconst_0
-            | Instruction::Lconst_1
             | Instruction::Fconst_0
             | Instruction::Fconst_1
             | Instruction::Fconst_2
-            | Instruction::Dconst_0
-            | Instruction::Dconst_1
             | Instruction::Bipush(..)
             | Instruction::Sipush(..)
             | Instruction::Ldc(..)
             | Instruction::Ldc_w(..)
-            | Instruction::Ldc2_w(..)
             | Instruction::Iload(..)
-            | Instruction::Lload(..)
             | Instruction::Fload(..)
-            | Instruction::Dload(..)
             | Instruction::Aload(..)
             | Instruction::Iload_0
             | Instruction::Iload_1
             | Instruction::Iload_2
             | Instruction::Iload_3
-            | Instruction::Lload_0
-            | Instruction::Lload_1
-            | Instruction::Lload_2
-            | Instruction::Lload_3
             | Instruction::Fload_0
             | Instruction::Fload_1
             | Instruction::Fload_2
             | Instruction::Fload_3
-            | Instruction::Dload_0
-            | Instruction::Dload_1
-            | Instruction::Dload_2
-            | Instruction::Dload_3
             | Instruction::Aload_0
             | Instruction::Aload_1
             | Instruction::Aload_2
             | Instruction::Aload_3
-            | Instruction::Iaload
-            | Instruction::Laload
-            | Instruction::Faload
-            | Instruction::Daload
-            | Instruction::Aaload
-            | Instruction::Baload
-            | Instruction::Caload
-            | Instruction::Saload
-            | Instruction::Dup
-            | Instruction::Dup_x1
-            | Instruction::Dup_x2
             | Instruction::Jsr(..)
-            | Instruction::Getstatic(..)
             | Instruction::New(..)
-            // Wide instructions
             | Instruction::Jsr_w(..)
             | Instruction::Iload_w(..)
-            | Instruction::Lload_w(..)
             | Instruction::Fload_w(..)
-            | Instruction::Dload_w(..)
-            | Instruction::Aload_w(..) => 1,
-            Instruction::Dup2 | Instruction::Dup2_x1 | Instruction::Dup2_x2 => 2,
-            Instruction::Pop
-            // Pop2 removes 1 value is the stack value is a category 1 value (e.g. Int), or it
-            // removes 2 values from the stack if it is a category 2 value (e.g. Long).  Since this
-            // function is used to calculate the maximum stack size, return -1; this may cause the
-            // maximum stack size to be larger than it needs to be, but it is better than the stack
-            // size being too small.
-            | Instruction::Pop2
-            | Instruction::Iadd
-            | Instruction::Ladd
-            | Instruction::Fadd
-            | Instruction::Dadd
-            | Instruction::Isub
-            | Instruction::Lsub
-            | Instruction::Fsub
-            | Instruction::Dsub
-            | Instruction::Imul
-            | Instruction::Lmul
-            | Instruction::Fmul
-            | Instruction::Dmul
-            | Instruction::Idiv
-            | Instruction::Ldiv
-            | Instruction::Fdiv
-            | Instruction::Ddiv
-            | Instruction::Irem
-            | Instruction::Lrem
-            | Instruction::Frem
-            | Instruction::Drem
-            | Instruction::Ineg
-            | Instruction::Lneg
-            | Instruction::Fneg
-            | Instruction::Dneg
-            | Instruction::Ishl
-            | Instruction::Lshl
-            | Instruction::Ishr
-            | Instruction::Lshr
-            | Instruction::Iushr
-            | Instruction::Lushr
-            | Instruction::Iand
-            | Instruction::Land
-            | Instruction::Ior
-            | Instruction::Lor
-            | Instruction::Ixor
-            | Instruction::Lxor
-            | Instruction::Lcmp
-            | Instruction::Fcmpl
-            | Instruction::Fcmpg
-            | Instruction::Dcmpl
-            | Instruction::Dcmpg
+            | Instruction::Aload_w(..) => (0, 1),
+
+            Instruction::Lconst_0
+            | Instruction::Lconst_1
+            | Instruction::Dconst_0
+            | Instruction::Dconst_1
+            | Instruction::Ldc2_w(..)
+            | Instruction::Lload(..)
+            | Instruction::Dload(..)
+            | Instruction::Lload_0
+            | Instruction::Lload_1
+            | Instruction::Lload_2
+            | Instruction::Lload_3
+            | Instruction::Dload_0
+            | Instruction::Dload_1
+            | Instruction::Dload_2
+            | Instruction::Dload_3
+            | Instruction::Lload_w(..)
+            | Instruction::Dload_w(..) => (0, 2),
+
+            Instruction::Istore(..)
+            | Instruction::Fstore(..)
+            | Instruction::Astore(..)
+            | Instruction::Istore_0
+            | Instruction::Istore_1
+            | Instruction::Istore_2
+            | Instruction::Istore_3
+            | Instruction::Fstore_0
+            | Instruction::Fstore_1
+            | Instruction::Fstore_2
+            | Instruction::Fstore_3
+            | Instruction::Astore_0
+            | Instruction::Astore_1
+            | Instruction::Astore_2
+            | Instruction::Astore_3
+            | Instruction::Pop
             | Instruction::Ifeq(..)
             | Instruction::Ifne(..)
             | Instruction::Iflt(..)
             | Instruction::Ifge(..)
             | Instruction::Ifgt(..)
             | Instruction::Ifle(..)
-            | Instruction::Tableswitch { .. }
-            | Instruction::Lookupswitch { .. }
+            | Instruction::Tableswitch(..)
+            | Instruction::Lookupswitch(..)
             | Instruction::Ireturn
-            | Instruction::Lreturn
             | Instruction::Freturn
-            | Instruction::Dreturn
             | Instruction::Areturn
-            | Instruction::Putstatic(..)
             | Instruction::Monitorenter
             | Instruction::Monitorexit
             | Instruction::Ifnull(..)
             | Instruction::Ifnonnull(..)
             | Instruction::Istore_w(..)
-            | Instruction::Lstore_w(..)
             | Instruction::Fstore_w(..)
-            | Instruction::Dstore_w(..)
-            | Instruction::Astore_w(..) => -1,
-            Instruction::If_icmpeq(..)
+            | Instruction::Astore_w(..)
+            | Instruction::Athrow => (1, 0),
+
+            Instruction::Lstore(..)
+            | Instruction::Dstore(..)
+            | Instruction::Lstore_0
+            | Instruction::Lstore_1
+            | Instruction::Lstore_2
+            | Instruction::Lstore_3
+            | Instruction::Dstore_0
+            | Instruction::Dstore_1
+            | Instruction::Dstore_2
+            | Instruction::Dstore_3
+            | Instruction::Pop2
+            | Instruction::If_icmpeq(..)
             | Instruction::If_icmpne(..)
             | Instruction::If_icmplt(..)
             | Instruction::If_icmpge(..)
@@ -1585,14 +1563,118 @@ impl Instruction {
             | Instruction::If_icmple(..)
             | Instruction::If_acmpeq(..)
             | Instruction::If_acmpne(..)
-            | Instruction::Putfield(..) => -2,
-            Instruction::Multianewarray(_index, dimensions) => {
-                // The array reference will be added back to the stack as a single value after the
-                // array is created. The number of dimensions is decremented by 1 to account for
-                // this.
-                let dimensions = dimensions.saturating_sub(1);
-                -i16::from(dimensions)
+            | Instruction::Lreturn
+            | Instruction::Dreturn
+            | Instruction::Lstore_w(..)
+            | Instruction::Dstore_w(..) => (2, 0),
+
+            Instruction::Iastore
+            | Instruction::Fastore
+            | Instruction::Aastore
+            | Instruction::Bastore
+            | Instruction::Castore
+            | Instruction::Sastore => (3, 0),
+
+            Instruction::Lastore | Instruction::Dastore => (4, 0),
+
+            Instruction::Ineg
+            | Instruction::Fneg
+            | Instruction::I2f
+            | Instruction::F2i
+            | Instruction::I2b
+            | Instruction::I2c
+            | Instruction::I2s
+            | Instruction::Newarray(..)
+            | Instruction::Anewarray(..)
+            | Instruction::Arraylength
+            | Instruction::Checkcast(..)
+            | Instruction::Instanceof(..) => (1, 1),
+
+            Instruction::I2l
+            | Instruction::I2d
+            | Instruction::F2l
+            | Instruction::F2d
+            | Instruction::Dup => (1, 2),
+
+            Instruction::Iaload
+            | Instruction::Faload
+            | Instruction::Aaload
+            | Instruction::Baload
+            | Instruction::Caload
+            | Instruction::Saload
+            | Instruction::Iadd
+            | Instruction::Fadd
+            | Instruction::Isub
+            | Instruction::Fsub
+            | Instruction::Imul
+            | Instruction::Fmul
+            | Instruction::Idiv
+            | Instruction::Fdiv
+            | Instruction::Irem
+            | Instruction::Frem
+            | Instruction::Iand
+            | Instruction::Ior
+            | Instruction::Ixor
+            | Instruction::L2i
+            | Instruction::L2f
+            | Instruction::D2i
+            | Instruction::D2f
+            | Instruction::Fcmpl
+            | Instruction::Fcmpg
+            | Instruction::Ishl
+            | Instruction::Ishr
+            | Instruction::Iushr => (2, 1),
+
+            Instruction::Laload
+            | Instruction::Daload
+            | Instruction::Lneg
+            | Instruction::Dneg
+            | Instruction::L2d
+            | Instruction::D2l
+            | Instruction::Swap => (2, 2),
+
+            Instruction::Dup_x1 => (2, 3),
+            Instruction::Dup2 => (2, 4),
+
+            Instruction::Lshl | Instruction::Lshr | Instruction::Lushr => (3, 2),
+            Instruction::Dup_x2 => (3, 4),
+            Instruction::Dup2_x1 => (3, 5),
+
+            Instruction::Lcmp | Instruction::Dcmpl | Instruction::Dcmpg => (4, 1),
+
+            Instruction::Ladd
+            | Instruction::Dadd
+            | Instruction::Lsub
+            | Instruction::Dsub
+            | Instruction::Lmul
+            | Instruction::Dmul
+            | Instruction::Ldiv
+            | Instruction::Ddiv
+            | Instruction::Lrem
+            | Instruction::Drem
+            | Instruction::Land
+            | Instruction::Lor
+            | Instruction::Lxor => (4, 2),
+
+            Instruction::Dup2_x2 => (4, 6),
+
+            Instruction::Getstatic(field_index) => {
+                (0, field_stack_slots(*field_index, constant_pool)?)
             }
+            Instruction::Putstatic(field_index) => {
+                (field_stack_slots(*field_index, constant_pool)?, 0)
+            }
+            Instruction::Getfield(field_index) => {
+                (1, field_stack_slots(*field_index, constant_pool)?)
+            }
+            Instruction::Putfield(field_index) => {
+                (1 + field_stack_slots(*field_index, constant_pool)?, 0)
+            }
+
+            Instruction::Multianewarray(_index, dimensions) => {
+                (u16::from(*dimensions), 1)
+            }
+
             Instruction::Invokevirtual(method_index)
             | Instruction::Invokespecial(method_index)
             | Instruction::Invokestatic(method_index) => {
@@ -1602,7 +1684,7 @@ impl Instruction {
                     constant_pool.try_get_name_and_type(*name_and_type_index)?;
                 let method_descriptor = constant_pool.try_get_utf8(*descriptor_index)?;
                 let has_receiver = !matches!(self, Instruction::Invokestatic(..));
-                invoke_stack_delta(method_descriptor, has_receiver)?
+                invoke_stack_effect(method_descriptor, has_receiver)?
             }
             Instruction::Invokedynamic(invoke_dynamic_index) => {
                 let (_bootstrap, name_and_type_index) =
@@ -1610,7 +1692,7 @@ impl Instruction {
                 let (_name_index, descriptor_index) =
                     constant_pool.try_get_name_and_type(*name_and_type_index)?;
                 let method_descriptor = constant_pool.try_get_utf8(*descriptor_index)?;
-                invoke_stack_delta(method_descriptor, false)?
+                invoke_stack_effect(method_descriptor, false)?
             }
             Instruction::Invokeinterface(method_index, ..) => {
                 let (_class_index, name_and_type_index) =
@@ -1618,11 +1700,25 @@ impl Instruction {
                 let (_name_index, descriptor_index) =
                     constant_pool.try_get_name_and_type(*name_and_type_index)?;
                 let method_descriptor = constant_pool.try_get_utf8(*descriptor_index)?;
-                invoke_stack_delta(method_descriptor, true)?
+                invoke_stack_effect(method_descriptor, true)?
             }
-            _ => 0,
         };
-        Ok(delta)
+
+        Ok(effect)
+    }
+
+    /// Returns the net operand-stack change in JVM stack slots.
+    ///
+    /// Category-2 values (`long` and `double`) occupy two slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a referenced field or method descriptor is invalid.
+    pub fn stack_delta(&self, constant_pool: &ConstantPool<'_>) -> Result<i16> {
+        let (popped_slots, pushed_slots) = self.stack_effect(constant_pool)?;
+        let popped_slots = i16::try_from(popped_slots)?;
+        let pushed_slots = i16::try_from(pushed_slots)?;
+        Ok(pushed_slots - popped_slots)
     }
 
     /// Return the max locals index utilized by the instruction references. This is useful for
@@ -2672,7 +2768,7 @@ mod test {
             "lconst_0",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -2688,7 +2784,7 @@ mod test {
             "lconst_1",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -2752,7 +2848,7 @@ mod test {
             "dconst_0",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -2768,7 +2864,7 @@ mod test {
             "dconst_1",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -2854,7 +2950,7 @@ mod test {
             "ldc2_w #2 // String foo",
             Instruction::Ldc2_w(index).to_formatted_string(&constant_pool)?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -2886,7 +2982,7 @@ mod test {
             "lload 42",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(43), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -2918,7 +3014,7 @@ mod test {
             "dload 42",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(43), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3014,7 +3110,7 @@ mod test {
             "lload_0",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(1), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3030,7 +3126,7 @@ mod test {
             "lload_1",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(2), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3046,7 +3142,7 @@ mod test {
             "lload_2",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(3), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3062,7 +3158,7 @@ mod test {
             "lload_3",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(4), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3142,7 +3238,7 @@ mod test {
             "dload_0",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(1), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3158,7 +3254,7 @@ mod test {
             "dload_1",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(2), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3174,7 +3270,7 @@ mod test {
             "dload_2",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(3), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3190,7 +3286,7 @@ mod test {
             "dload_3",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(4), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3270,7 +3366,7 @@ mod test {
             "iaload",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3286,7 +3382,7 @@ mod test {
             "laload",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3302,7 +3398,7 @@ mod test {
             "faload",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3318,7 +3414,7 @@ mod test {
             "daload",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3334,7 +3430,7 @@ mod test {
             "aaload",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3350,7 +3446,7 @@ mod test {
             "baload",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3366,7 +3462,7 @@ mod test {
             "caload",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3382,7 +3478,7 @@ mod test {
             "saload",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3398,7 +3494,7 @@ mod test {
             "istore 42",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(42), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3414,7 +3510,7 @@ mod test {
             "lstore 42",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(43), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3430,7 +3526,7 @@ mod test {
             "fstore 42",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(42), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3446,7 +3542,7 @@ mod test {
             "dstore 42",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(43), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3462,7 +3558,7 @@ mod test {
             "astore 42",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(42), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3478,7 +3574,7 @@ mod test {
             "istore_0",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(0), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3494,7 +3590,7 @@ mod test {
             "istore_1",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(1), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3510,7 +3606,7 @@ mod test {
             "istore_2",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(2), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3526,7 +3622,7 @@ mod test {
             "istore_3",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(3), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3542,7 +3638,7 @@ mod test {
             "lstore_0",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(1), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3558,7 +3654,7 @@ mod test {
             "lstore_1",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(2), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3574,7 +3670,7 @@ mod test {
             "lstore_2",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(3), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3590,7 +3686,7 @@ mod test {
             "lstore_3",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(4), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3606,7 +3702,7 @@ mod test {
             "fstore_0",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(0), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3622,7 +3718,7 @@ mod test {
             "fstore_1",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(1), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3638,7 +3734,7 @@ mod test {
             "fstore_2",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(2), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3654,7 +3750,7 @@ mod test {
             "fstore_3",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(3), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3670,7 +3766,7 @@ mod test {
             "dstore_0",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(1), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3686,7 +3782,7 @@ mod test {
             "dstore_1",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(2), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3702,7 +3798,7 @@ mod test {
             "dstore_2",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(3), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3718,7 +3814,7 @@ mod test {
             "dstore_3",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(4), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3734,7 +3830,7 @@ mod test {
             "astore_0",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(0), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3750,7 +3846,7 @@ mod test {
             "astore_1",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(1), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3766,7 +3862,7 @@ mod test {
             "astore_2",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(2), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3782,7 +3878,7 @@ mod test {
             "astore_3",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(3), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3798,7 +3894,7 @@ mod test {
             "iastore",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-3, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3814,7 +3910,7 @@ mod test {
             "lastore",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-4, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3830,7 +3926,7 @@ mod test {
             "fastore",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-3, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3846,7 +3942,7 @@ mod test {
             "dastore",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-4, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3862,7 +3958,7 @@ mod test {
             "aastore",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-3, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3878,7 +3974,7 @@ mod test {
             "bastore",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-3, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3894,7 +3990,7 @@ mod test {
             "castore",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-3, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3910,7 +4006,7 @@ mod test {
             "sastore",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-3, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -3942,7 +4038,7 @@ mod test {
             "pop2",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4086,7 +4182,7 @@ mod test {
             "ladd",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4118,7 +4214,7 @@ mod test {
             "dadd",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4150,7 +4246,7 @@ mod test {
             "lsub",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4182,7 +4278,7 @@ mod test {
             "dsub",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4214,7 +4310,7 @@ mod test {
             "lmul",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4246,7 +4342,7 @@ mod test {
             "dmul",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4278,7 +4374,7 @@ mod test {
             "ldiv",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4310,7 +4406,7 @@ mod test {
             "ddiv",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4342,7 +4438,7 @@ mod test {
             "lrem",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4374,7 +4470,7 @@ mod test {
             "drem",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4390,7 +4486,7 @@ mod test {
             "ineg",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4406,7 +4502,7 @@ mod test {
             "lneg",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4422,7 +4518,7 @@ mod test {
             "fneg",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4438,7 +4534,7 @@ mod test {
             "dneg",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4566,7 +4662,7 @@ mod test {
             "land",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4598,7 +4694,7 @@ mod test {
             "lor",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4630,7 +4726,7 @@ mod test {
             "lxor",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4662,7 +4758,7 @@ mod test {
             "i2l",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4694,7 +4790,7 @@ mod test {
             "i2d",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4710,7 +4806,7 @@ mod test {
             "l2i",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4726,7 +4822,7 @@ mod test {
             "l2f",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4774,7 +4870,7 @@ mod test {
             "f2l",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4790,7 +4886,7 @@ mod test {
             "f2d",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4806,7 +4902,7 @@ mod test {
             "d2i",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4838,7 +4934,7 @@ mod test {
             "d2f",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4902,7 +4998,7 @@ mod test {
             "lcmp",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-3, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4950,7 +5046,7 @@ mod test {
             "dcmpl",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-3, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -4966,7 +5062,7 @@ mod test {
             "dcmpg",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-3, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -5325,7 +5421,7 @@ mod test {
             "lreturn",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -5357,7 +5453,7 @@ mod test {
             "dreturn",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -5408,7 +5504,7 @@ mod test {
             "getstatic #6 // Field Foo.x",
             Instruction::Getstatic(field_index).to_formatted_string(&constant_pool)?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(1, Instruction::Getstatic(field_index).stack_delta(&constant_pool)?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -5427,7 +5523,7 @@ mod test {
             "putstatic #6 // Field Foo.x",
             Instruction::Putstatic(field_index).to_formatted_string(&constant_pool)?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, Instruction::Putstatic(field_index).stack_delta(&constant_pool)?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -5446,7 +5542,7 @@ mod test {
             "getfield #6 // Field Foo.x",
             Instruction::Getfield(field_index).to_formatted_string(&constant_pool)?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(0, Instruction::Getfield(field_index).stack_delta(&constant_pool)?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -5465,10 +5561,37 @@ mod test {
             "putfield #6 // Field Foo.x",
             Instruction::Putfield(field_index).to_formatted_string(&constant_pool)?
         );
-        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, Instruction::Putfield(field_index).stack_delta(&constant_pool)?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
+
+    #[test]
+    fn test_category_two_field_stack_delta() -> Result<()> {
+        let mut constant_pool = ConstantPool::new();
+        let class_index = constant_pool.add_class("Foo")?;
+        let field_index = constant_pool.add_field_ref(class_index, "value", "J")?;
+
+        assert_eq!(
+            2,
+            Instruction::Getstatic(field_index).stack_delta(&constant_pool)?
+        );
+        assert_eq!(
+            -2,
+            Instruction::Putstatic(field_index).stack_delta(&constant_pool)?
+        );
+        assert_eq!(
+            1,
+            Instruction::Getfield(field_index).stack_delta(&constant_pool)?
+        );
+        assert_eq!(
+            -3,
+            Instruction::Putfield(field_index).stack_delta(&constant_pool)?
+        );
+
+        Ok(())
+    }
+
 
     #[test]
     fn test_invokevirtual() -> Result<()> {
@@ -5575,6 +5698,33 @@ mod test {
         assert_eq!(-3, instruction.stack_delta(&constant_pool)?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
+    }
+
+    #[test]
+    fn test_stack_effect_uses_jvm_slots() -> Result<()> {
+        let mut constant_pool = ConstantPool::new();
+        let class_index = constant_pool.add_class("Foo")?;
+        let field_index = constant_pool.add_field_ref(class_index, "value", "J")?;
+        let method_index = constant_pool.add_method_ref(class_index, "method", "(I)D")?;
+
+        assert_eq!(
+            (1, 1),
+            Instruction::Newarray(ArrayType::Int).stack_effect(&constant_pool)?
+        );
+        assert_eq!((2, 2), Instruction::Lneg.stack_effect(&constant_pool)?);
+        assert_eq!(
+            (1, 2),
+            Instruction::Getfield(field_index).stack_effect(&constant_pool)?
+        );
+        assert_eq!(
+            (3, 0),
+            Instruction::Putfield(field_index).stack_effect(&constant_pool)?
+        );
+        assert_eq!(
+            (2, 2),
+            Instruction::Invokevirtual(method_index).stack_effect(&constant_pool)?
+        );
+        Ok(())
     }
 
     #[test]
@@ -5715,7 +5865,7 @@ mod test {
             "athrow",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(0, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -5960,7 +6110,7 @@ mod test {
             "lload_w 42",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(43), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, wide_code)
     }
@@ -5994,7 +6144,7 @@ mod test {
             "dload_w 42",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(43), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, wide_code)
     }
@@ -6045,7 +6195,7 @@ mod test {
             "lstore_w 42",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(43), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, wide_code)
     }
@@ -6079,7 +6229,7 @@ mod test {
             "dstore_w 42",
             instruction.to_formatted_string(&ConstantPool::new())?
         );
-        assert_eq!(-1, instruction.stack_delta(&ConstantPool::new())?);
+        assert_eq!(-2, instruction.stack_delta(&ConstantPool::new())?);
         assert_eq!(Some(43), instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, wide_code)
     }
