@@ -113,7 +113,10 @@ mod tests {
     #[tokio::test]
     async fn test_interrupt() {
         let (_vm, thread) = crate::test::thread().await.expect("thread");
-        let result = interrupt(thread, Parameters::new(vec![Value::Int(0)])).await;
+        // File descriptor 0 is stdin and is not a deterministic error case: under a PTY it may be
+        // opened read/write, so `write(0, ..)` can legitimately succeed. Use -1 to exercise the
+        // invalid-descriptor error path without depending on the test runner's stdio setup.
+        let result = interrupt(thread, Parameters::new(vec![Value::Int(-1)])).await;
         assert!(result.is_err());
     }
 
