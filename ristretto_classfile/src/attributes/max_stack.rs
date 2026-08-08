@@ -4,6 +4,11 @@ use crate::{ConstantPool, Error, Result};
 use ahash::{AHashMap, AHashSet};
 use std::collections::VecDeque;
 
+/// Identity of a legacy `jsr` return address.
+///
+/// The continuation is the instruction immediately following the call site. `target` is retained
+/// as part of the identity so nested/subsequent subroutine calls can be distinguished without
+/// collapsing distinct control-flow states that happen to share a continuation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ReturnAddress {
     call_site: usize,
@@ -11,6 +16,11 @@ struct ReturnAddress {
     continuation: usize,
 }
 
+/// Operand-stack value shape needed for max-stack analysis.
+///
+/// This deliberately tracks JVM categories rather than full verification types. The calculator
+/// needs exact slot widths and special handling for legacy `returnAddress` values, but it is not a
+/// replacement for the bytecode type verifier.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum StackValue {
     Category1,
@@ -46,6 +56,11 @@ struct StackNode {
     depth: u16,
 }
 
+/// Persistent, interned representation of operand stacks.
+///
+/// Control-flow analysis revisits the same stack shapes frequently. Interning `(top, previous)`
+/// nodes makes cloning a flow state constant-time and gives equal stack shapes a stable identity,
+/// avoiding repeated `Vec<StackValue>` allocations across branches and loops.
 #[derive(Default)]
 struct StackArena {
     nodes: Vec<StackNode>,
@@ -58,9 +73,10 @@ impl StackArena {
             return Ok(0);
         }
 
-        let index = stack.0.checked_sub(1).ok_or_else(|| {
-            verification_error("invalid operand-stack identifier".to_string())
-        })?;
+        let index = stack
+            .0
+            .checked_sub(1)
+            .ok_or_else(|| verification_error("invalid operand-stack identifier".to_string()))?;
         self.nodes
             .get(index)
             .map(|node| node.depth)
@@ -76,7 +92,9 @@ impl StackArena {
         let depth = self
             .depth(stack)?
             .checked_add(value.slots())
-            .ok_or_else(|| verification_error("operand stack exceeds u16::MAX slots".to_string()))?;
+            .ok_or_else(|| {
+                verification_error("operand stack exceeds u16::MAX slots".to_string())
+            })?;
         let raw_id = self
             .nodes
             .len()
@@ -136,6 +154,10 @@ enum ReturnAddressLocal {
     Invalid,
 }
 
+/// Complete analysis state at the entry to one logical instruction.
+///
+/// `return_address_locals` and `subroutines` exist solely for pre-Java-6 `jsr`/`ret` bytecode. For
+/// ordinary modern bytecode the state is effectively just `(instruction, stack)`.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct FlowState {
     instruction: usize,
@@ -144,6 +166,10 @@ struct FlowState {
     subroutines: Vec<ReturnAddress>,
 }
 
+/// Breadth-first fixed-point worklist for reachable control-flow states.
+///
+/// States are deduplicated by exact stack/category and legacy-subroutine state. The maximum depth
+/// is observed both when a state is enqueued and after an instruction is applied.
 #[derive(Default)]
 struct Worklist {
     visited: AHashSet<FlowState>,
@@ -230,11 +256,7 @@ fn pop_slots(stacks: &StackArena, stack: &mut StackId, slots: u16) -> Result<()>
     Ok(())
 }
 
-fn push_slots(
-    stacks: &mut StackArena,
-    stack: &mut StackId,
-    slots: u16,
-) -> Result<()> {
+fn push_slots(stacks: &mut StackArena, stack: &mut StackId, slots: u16) -> Result<()> {
     let value = match slots {
         0 => return Ok(()),
         1 => StackValue::Category1,
@@ -305,9 +327,9 @@ fn invalidate_return_addresses(
 
 fn written_local(instruction: &Instruction) -> Option<(u16, u16)> {
     match instruction {
-        Instruction::Istore(index)
-        | Instruction::Fstore(index)
-        | Instruction::Astore(index) => Some((u16::from(*index), 1)),
+        Instruction::Istore(index) | Instruction::Fstore(index) | Instruction::Astore(index) => {
+            Some((u16::from(*index), 1))
+        }
         Instruction::Lstore(index) | Instruction::Dstore(index) => Some((u16::from(*index), 2)),
         Instruction::Istore_0 | Instruction::Fstore_0 | Instruction::Astore_0 => Some((0, 1)),
         Instruction::Istore_1 | Instruction::Fstore_1 | Instruction::Astore_1 => Some((1, 1)),
@@ -793,11 +815,12 @@ fn analyze(
     )?;
 
     while let Some(mut state) = worklist.queue.pop_front() {
-        let instruction = instructions
-            .get(state.instruction)
-            .ok_or(Error::InvalidInstructionOffset(u32::try_from(
-                state.instruction,
-            )?))?;
+        let instruction =
+            instructions
+                .get(state.instruction)
+                .ok_or(Error::InvalidInstructionOffset(u32::try_from(
+                    state.instruction,
+                )?))?;
 
         enqueue_exception_handlers(&mut worklist, &mut stacks, &state, exception_table)?;
 
@@ -845,17 +868,39 @@ fn analyze(
     Ok(worklist.max_stack)
 }
 
-/// Calculates the maximum operand-stack depth for an instruction sequence, including exception
-/// handlers.
+/// Calculates the maximum operand-stack depth reachable in an instruction sequence, including
+/// exception handlers.
 ///
-/// The result is expressed in JVM stack slots and is suitable for the `max_stack` field of a
-/// method's `Code` attribute. The analysis follows all branch and switch targets, exception-handler
-/// edges, and legacy `jsr`/`ret` subroutine return addresses.
+/// JVM `Code.max_stack` is measured in **slots**, not logical values: category-1 values occupy one
+/// slot, while `long` and `double` occupy two. A linear sum of instruction deltas is therefore not
+/// sufficient. This analysis follows the actual control-flow graph and keeps the operand-stack
+/// category shape for every reachable state.
+///
+/// In particular, the analysis:
+///
+/// - follows conditional branches, `goto`, `tableswitch`, and `lookupswitch` targets independently
+///   instead of accumulating mutually exclusive paths;
+/// - starts every reachable exception handler with exactly one category-1 exception reference, as
+///   required by JVMS §4.7.3;
+/// - handles all legal category-1/category-2 forms of `pop2`, `dup*`, and `swap`;
+/// - models legacy `jsr`/`ret` return addresses so old class files can still be analyzed;
+/// - rejects operand-stack underflow and malformed control-flow targets encountered during the
+///   calculation.
+///
+/// This function is a **max-stack calculator, not a full bytecode verifier**. It tracks slot width
+/// and the special `returnAddress` type, but it intentionally does not prove general JVM type
+/// compatibility (for example, that `iadd` receives two actual `int` values). Full type safety is
+/// the responsibility of Ristretto's verifier.
+///
+/// The exception table uses Ristretto's logical instruction indices. Its `range_pc.end` is
+/// exclusive and may equal `instructions.len()` when the protected range extends through the final
+/// instruction.
 ///
 /// # Errors
 ///
-/// Returns an error if an instruction target, exception-table entry, field descriptor, method
-/// descriptor, return address, or operand-stack state is invalid.
+/// Returns an error if a reachable path has stack underflow/overflow, uses an invalid branch or
+/// exception-table target, references an invalid field/method descriptor, or violates the
+/// `jsr`/`ret` return-address constraints modeled by this analysis.
 ///
 /// # References
 ///
@@ -870,7 +915,12 @@ pub fn max_stack_with_exception_table(
     analyze(instructions, constant_pool, exception_table)
 }
 
-/// Trait for calculating the maximum operand-stack size required by JVM bytecode instructions.
+/// Trait for calculating the maximum operand-stack size required by a sequence of JVM bytecode
+/// instructions.
+///
+/// The analysis starts at instruction zero and follows reachable control flow. The returned value
+/// is suitable for the `max_stack` field of a `Code` attribute when the method has no exception
+/// handlers. For methods with handlers, use [`max_stack_with_exception_table`].
 ///
 /// # Examples
 ///
@@ -878,13 +928,17 @@ pub fn max_stack_with_exception_table(
 /// use ristretto_classfile::attributes::{Instruction, MaxStack};
 /// use ristretto_classfile::ConstantPool;
 ///
+/// // A constant pool is required because field and invoke instructions obtain their descriptors
+/// // from it when calculating slot widths.
 /// let constant_pool = ConstantPool::new();
+///
+/// // Define a valid sequence that reaches a maximum depth of two JVM slots.
 /// let instructions = [
-///     Instruction::Iconst_0,
-///     Instruction::Iconst_1,
-///     Instruction::Pop,
-///     Instruction::Pop,
-///     Instruction::Return,
+///     Instruction::Iconst_0,  // Push int 0 (+1 slot). Current depth: 1.
+///     Instruction::Iconst_1,  // Push int 1 (+1 slot). Current/max depth: 2.
+///     Instruction::Pop,       // Remove one category-1 value. Current depth: 1.
+///     Instruction::Pop,       // Remove the remaining value. Current depth: 0.
+///     Instruction::Return,    // Return does not change the operand stack.
 /// ];
 ///
 /// let max_size = instructions.max_stack(&constant_pool)?;
@@ -892,20 +946,25 @@ pub fn max_stack_with_exception_table(
 /// # Ok::<(), ristretto_classfile::Error>(())
 /// ```
 ///
+/// `long` and `double` values count as two slots, so for example `Lconst_0` alone requires a
+/// `max_stack` of 2 even though it pushes one logical value.
+///
 /// # References
 ///
 /// - [JVMS §2.6.2](https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-2.html#jvms-2.6.2)
 /// - [JVMS §4.7.3](https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.7.3)
 pub trait MaxStack {
-    /// Calculates the maximum operand-stack depth reachable from the method entry.
+    /// Calculates the maximum operand-stack depth reachable from instruction zero.
     ///
-    /// The result is expressed in JVM stack slots. Use [`max_stack_with_exception_table`] when the
-    /// method has exception handlers.
+    /// The result is expressed in JVM stack slots. Category-2 values (`long` and `double`) consume
+    /// two slots. Use [`max_stack_with_exception_table`] when the method has exception handlers so
+    /// the one-slot handler entry state is included in the result.
     ///
     /// # Errors
     ///
-    /// Returns an error if an instruction target, field descriptor, method descriptor, return
-    /// address, or operand-stack state is invalid.
+    /// Returns an error if a reachable path underflows or overflows the modeled operand stack, a
+    /// control-flow target is invalid, a referenced field/method descriptor cannot be parsed, or a
+    /// modeled legacy `jsr`/`ret` return-address constraint is violated.
     fn max_stack(&self, constant_pool: &ConstantPool<'_>) -> Result<u16>;
 }
 

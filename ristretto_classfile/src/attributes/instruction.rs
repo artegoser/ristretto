@@ -10,11 +10,23 @@ use indexmap::IndexMap;
 use std::fmt;
 use std::io::Cursor;
 
-/// Returns the operand-stack slots consumed and produced by an `invoke*` instruction.
+/// Computes the operand-stack effect of an `invoke*` instruction from the method descriptor
+/// referenced by its constant-pool entry.
+///
+/// Per JVMS §2.6.2 and the `invoke*` instruction definitions:
+///
+/// - each parameter consumes [`FieldType::slot_count`] operand-stack slots;
+/// - instance invocation additionally consumes one category-1 receiver slot (`this`);
+/// - a non-`void` return value produces [`FieldType::slot_count`] slots.
+///
+/// Returning the consumed and produced counts separately is important for max-stack analysis. A
+/// net delta alone loses information; for example, `(J)J` has a delta of zero even though the
+/// invocation still requires a two-slot `long` argument to be present on entry.
 ///
 /// # Errors
 ///
-/// Returns an error if the method descriptor cannot be parsed.
+/// Returns an error if the method descriptor cannot be parsed or the consumed slot count cannot be
+/// represented as `u16`.
 fn invoke_stack_effect(descriptor: &JavaStr, has_receiver: bool) -> Result<(u16, u16)> {
     let (parameters, return_type) = FieldType::parse_method_descriptor(descriptor)?;
     let mut pops = u32::from(has_receiver);
@@ -1431,8 +1443,14 @@ impl Instruction {
 
     /// Returns the operand-stack slots consumed and produced by the instruction.
     ///
-    /// The returned tuple is `(popped_slots, pushed_slots)`. Category-2 values (`long` and
-    /// `double`) occupy two slots.
+    /// The returned tuple is `(popped_slots, pushed_slots)`. The counts are expressed in JVM
+    /// operand-stack **slots**, not Rust values or logical JVM values: category-1 values occupy one
+    /// slot, while category-2 values (`long` and `double`) occupy two. This distinction is required
+    /// by the `Code.max_stack` definition in JVMS §4.7.3.
+    ///
+    /// Stack-manipulation opcodes such as `dup2_x2` have multiple legal category layouts. Their
+    /// slot counts are still fixed, so this method reports the common slot effect; the shape-aware
+    /// validation used by max-stack analysis lives in `attributes::max_stack`.
     ///
     /// # Errors
     ///
@@ -1544,6 +1562,8 @@ impl Instruction {
             | Instruction::Astore_w(..)
             | Instruction::Athrow => (1, 0),
 
+            // `pop2` has two legal forms: one category-2 value or two category-1 values. Both
+            // forms consume exactly two JVM slots. `max_stack` performs the category-shape check.
             Instruction::Lstore(..)
             | Instruction::Dstore(..)
             | Instruction::Lstore_0
@@ -1672,6 +1692,10 @@ impl Instruction {
             }
 
             Instruction::Multianewarray(_index, dimensions) => {
+                // One int count is consumed for every requested dimension, then the newly created
+                // array reference is pushed as a single category-1 value. Thus the net slot delta
+                // is `1 - dimensions`, but keeping the two counts separate also captures the input
+                // stack requirement.
                 (u16::from(*dimensions), 1)
             }
 
@@ -5504,7 +5528,10 @@ mod test {
             "getstatic #6 // Field Foo.x",
             Instruction::Getstatic(field_index).to_formatted_string(&constant_pool)?
         );
-        assert_eq!(1, Instruction::Getstatic(field_index).stack_delta(&constant_pool)?);
+        assert_eq!(
+            1,
+            Instruction::Getstatic(field_index).stack_delta(&constant_pool)?
+        );
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -5523,7 +5550,10 @@ mod test {
             "putstatic #6 // Field Foo.x",
             Instruction::Putstatic(field_index).to_formatted_string(&constant_pool)?
         );
-        assert_eq!(-1, Instruction::Putstatic(field_index).stack_delta(&constant_pool)?);
+        assert_eq!(
+            -1,
+            Instruction::Putstatic(field_index).stack_delta(&constant_pool)?
+        );
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -5542,7 +5572,10 @@ mod test {
             "getfield #6 // Field Foo.x",
             Instruction::Getfield(field_index).to_formatted_string(&constant_pool)?
         );
-        assert_eq!(0, Instruction::Getfield(field_index).stack_delta(&constant_pool)?);
+        assert_eq!(
+            0,
+            Instruction::Getfield(field_index).stack_delta(&constant_pool)?
+        );
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -5561,7 +5594,10 @@ mod test {
             "putfield #6 // Field Foo.x",
             Instruction::Putfield(field_index).to_formatted_string(&constant_pool)?
         );
-        assert_eq!(-2, Instruction::Putfield(field_index).stack_delta(&constant_pool)?);
+        assert_eq!(
+            -2,
+            Instruction::Putfield(field_index).stack_delta(&constant_pool)?
+        );
         assert_eq!(None, instruction.max_locals_index()?);
         test_instruction(&instruction, &expected_bytes, code)
     }
@@ -5591,7 +5627,6 @@ mod test {
 
         Ok(())
     }
-
 
     #[test]
     fn test_invokevirtual() -> Result<()> {

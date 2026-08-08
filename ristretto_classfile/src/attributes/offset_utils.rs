@@ -872,5 +872,4 @@ mod tests {
         assert_eq!(instructions, instructions_from_bytes.as_slice());
         Ok(())
     }
-
 }
